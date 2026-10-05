@@ -1,1 +1,226 @@
+name: Build OpenBubbles Together Test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: together-test-build
+  cancel-in-progress: false
+jobs:
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Fetch pinned source and apply Together bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/OpenBubbles/openbubbles-app.git source
+          cd source
+          git checkout eed1b6332efbb17adbf5ebfa2263ad770169f75e
+          git -c url.https://github.com/.insteadOf=git@github.com: submodule update --init --recursive
+          cat > ../bridge.patch <<'TOGETHER_PATCH'
+          diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+          index 3f99ba3..d8c3c05 100644
+          --- a/android/app/src/main/AndroidManifest.xml
+          +++ b/android/app/src/main/AndroidManifest.xml
+          @@ -304,6 +304,9 @@
+                       android:authorities="${applicationId}.firebaseinitprovider"
+                       tools:node="remove" />
+ 
+          +        <activity android:name=".TogetherBridgeActivity" android:exported="true"
+          +            android:excludeFromRecents="true" android:theme="@android:style/Theme.Material.Dialog.Alert"
+          +            android:configChanges="orientation|screenSize" />
+                   <activity
+                       android:name=".MainActivity"
+                       android:allowEmbedded="true"
+          diff --git a/android/app/src/main/kotlin/com/bluebubbles/messaging/TogetherBridgeActivity.kt b/android/app/src/main/kotlin/com/bluebubbles/messaging/TogetherBridgeActivity.kt
+          new file mode 100644
+          index 0000000..84ef50b
+          --- /dev/null
+          +++ b/android/app/src/main/kotlin/com/bluebubbles/messaging/TogetherBridgeActivity.kt
+          @@ -0,0 +1,65 @@
+          +package com.bluebubbles.messaging
+          +
+          +import android.app.Activity
+          +import android.app.AlertDialog
+          +import android.content.Intent
+          +import android.os.Bundle
+          +import android.os.Handler
+          +import android.os.Looper
+          +import io.flutter.plugin.common.MethodChannel
+          +
+          +/** Read-only prototype. Approval is required for EVERY lookup; never sends. */
+          +class TogetherBridgeActivity : Activity() {
+          +    private val timer = Handler(Looper.getMainLooper())
+          +    private var completed = false
+          +    private var requestId = ""
+          +    private val deadline = Runnable { complete("unknown", "timeout") }
+          +
+          +    override fun onCreate(state: Bundle?) {
+          +        super.onCreate(state)
+          +        // Android supplies callingPackage for startActivityForResult, not caller extras.
+          +        if (callingPackage != "com.whitney.unified") { finish(); return }
+          +        requestId = intent.getStringExtra("request_id") ?: ""
+          +        val number = intent.getStringExtra("number") ?: ""
+          +        if (intent.getIntExtra("protocol", 0) != 1 || requestId.length !in 1..80 ||
+          +            !number.matches(Regex("\\+[1-9][0-9]{6,14}"))) {
+          +            complete("unknown", "invalid_request"); return
+          +        }
+          +        // No persistent grant: each request is explicitly approved on this trusted screen.
+          +        AlertDialog.Builder(this)
+          +            .setTitle("Allow Together to check iMessage?")
+          +            .setMessage("Check $number using your OpenBubbles account?\n\nThis shares whether iMessage is available with Together. No message will be sent.")
+          +            .setNegativeButton("Cancel") { _, _ -> complete("unknown", "cancelled") }
+          +            .setPositiveButton("Check number") { _, _ -> check(number) }
+          +            .setOnCancelListener { complete("unknown", "cancelled") }
+          +            .show()
+          +    }
+          +
+          +    private fun check(number: String) {
+          +        val engine = MainActivity.engine
+          +        if (engine == null || !MainActivity.engine_ready) {
+          +            complete("unknown", "open_openbubbles_first"); return
+          +        }
+          +        timer.postDelayed(deadline, 20000)
+          +        MethodChannel(engine.dartExecutor.binaryMessenger, "com.openbubbles.together.lookup.v1")
+          +            .invokeMethod("checkAvailability", mapOf("number" to number), object : MethodChannel.Result {
+          +                override fun success(result: Any?) {
+          +                    val status = result as? String
+          +                    complete(if (status == "available" || status == "unavailable") status else "unknown", "")
+          +                }
+          +                override fun error(code: String, message: String?, details: Any?) { complete("unknown", "check_failed") }
+          +                override fun notImplemented() { complete("unknown", "bridge_not_ready") }
+          +            })
+          +    }
+          +
+          +    private fun complete(status: String, reason: String) {
+          +        if (completed || isFinishing || isDestroyed) return
+          +        completed = true
+          +        timer.removeCallbacks(deadline)
+          +        setResult(RESULT_OK, Intent().putExtra("protocol", 1).putExtra("request_id", requestId)
+          +            .putExtra("status", status).putExtra("reason", reason))
+          +        finish()
+          +    }
+          +
+          +    override fun onDestroy() { timer.removeCallbacks(deadline); super.onDestroy() }
+          +}
+          diff --git a/lib/services/backend/java_dart_interop/method_channel_service.dart b/lib/services/backend/java_dart_interop/method_channel_service.dart
+          index 6e48850..1f6809e 100644
+          --- a/lib/services/backend/java_dart_interop/method_channel_service.dart
+          +++ b/lib/services/backend/java_dart_interop/method_channel_service.dart
+          @@ -1,3 +1,4 @@
+          +import 'package:bluebubbles/services/network/backend_service.dart';
+           import 'dart:async';
+           import 'dart:collection';
+           import 'dart:convert';
+          @@ -33,6 +34,24 @@ class MethodChannelService extends GetxService {
+               background = headless;
+               channel = const MethodChannel('com.bluebubbles.messaging');
+               channel.setMethodCallHandler(_callHandler);
+          +    // Read-only Together prototype: errors stay unknown, never become unavailable.
+          +    if (!headless) {
+          +      const MethodChannel('com.openbubbles.together.lookup.v1')
+          +          .setMethodCallHandler((call) async {
+          +        if (call.method != 'checkAvailability') throw MissingPluginException();
+          +        final number = call.argument<String>('number');
+          +        if (number == null || !RegExp(r'^\+[1-9][0-9]{6,14}$').hasMatch(number)) {
+          +          throw PlatformException(code: 'invalid_number');
+          +        }
+          +        try {
+          +          final available = await backend.handleiMessageState(number)
+          +              .timeout(const Duration(seconds: 15));
+          +          return available ? 'available' : 'unavailable';
+          +        } catch (_) {
+          +          throw PlatformException(code: 'lookup_failed');
+          +        }
+          +      });
+          +    }
+               channel.invokeMethod("ready");
+               if (!kIsWeb && !kIsDesktop && !headless) {
+                 try {
+          TOGETHER_PATCH
+          git apply --check ../bridge.patch
+          git apply ../bridge.patch
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: stable
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang cmake ninja-build pkg-config libssl-dev
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;26.3.11579264'
+      - name: Prepare upstream test-build certificate placeholders
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          # Mirrors upstream public CI. These are NOT production activation credentials.
+          # A successful build does not establish that Apple account activation will work.
+          python3 - <<'PYCODE'
+          import re, shutil
+          from pathlib import Path
+          root = Path('rustpush')
+          target = root / 'certs/fairplay'
+          target.mkdir(parents=True, exist_ok=True)
+          for name in re.findall(r'include_cert!\("([0-9]+)"\)', (root / 'src/activation.rs').read_text()):
+              for ext in ('pem', 'crt'):
+                  shutil.copyfile(root / ('certs/legacy-fairplay/fairplay.' + ext), target / (name + '.' + ext))
+          PYCODE
+      - name: Resolve dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee ../dependencies.log
+      - name: Build separate alpha APK
+        working-directory: source
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --flavor alpha --debug --target-platform android-arm64 2>&1 | tee ../build.log
+      - name: Verify APK signature and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=source/build/app/outputs/flutter-apk/app-alpha-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$apk"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" > package-info.txt
+          grep -q "package: name='com.bluebubbles.messaging.alpha'" package-info.txt
+          cp "$apk" OpenBubbles-Together-Test.apk
+          sha256sum OpenBubbles-Together-Test.apk > SHA256.txt
+      - name: Downloadable test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenBubbles-Together-Test-APK
+          path: |
+            OpenBubbles-Together-Test.apk
+            SHA256.txt
+            package-info.txt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Save diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-logs
+          path: |
+            dependencies.log
+            build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
