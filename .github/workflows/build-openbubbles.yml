@@ -157,7 +157,7 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools'
-        uses: android-actions/setup-android@v3
+        
       - name: Install build dependencies
         shell: bash
         run: |
