@@ -123,7 +123,7 @@ jobs:
           +      const MethodChannel('com.openbubbles.together.lookup.v1')
           +          .setMethodCallHandler((call) async {
           +        if (call.method != 'checkAvailability') throw MissingPluginException();
-          +        final number = call.argument<String>('number');
+          +        final number = (call.arguments as Map)['number'] as String?;
           +        if (number == null || !RegExp(r'^\+[1-9][0-9]{6,14}$').hasMatch(number)) {
           +          throw PlatformException(code: 'invalid_number');
           +        }
